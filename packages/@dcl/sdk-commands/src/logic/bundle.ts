@@ -19,6 +19,7 @@ import { getAllComposites, type Script } from './composite'
 import { isEditorScene } from './project-validations'
 import { watch } from 'chokidar'
 import { debounce } from './debounce'
+import { chunkPaths, isRegistryModule, loaderStub, registryKeys, sceneExternals, sdkRuntimeEntry } from './split'
 
 export type BundleComponents = Pick<CliComponents, 'logger' | 'fs'>
 
@@ -45,6 +46,11 @@ export type CompileOptions = {
 }
 
 const MAX_STEP = 2
+const SPLIT_MAX_STEP = 3
+
+// Host modules plus the inspector, kept out of every bundle (the inspector must never
+// leak into the scene runtime). Shared by the normal, scene-chunk and SDK-chunk builds.
+const HOST_AND_INSPECTOR_EXTERNALS = ['~system/*', '@dcl/inspector', '@dcl/inspector/*']
 
 // Keep only the last 10KB of output to prevent memory leaks in watch mode
 const MAX_OUTPUT_SIZE = 10 * 1024
@@ -163,19 +169,7 @@ type SingleProjectOptions = CompileOptions & {
   outputFile: string
 }
 
-export async function bundleSingleProject(components: BundleComponents, options: SingleProjectOptions) {
-  printProgressStep(components.logger, `Bundling file ${colors.bold(options.entrypoint)}`, 1, MAX_STEP)
-  const editorScene = await isEditorScene(components, options.workingDirectory)
-
-  // Pre-compute composite data so we can inject maxCompositeEntity via esbuild define.
-  // This must happen before the esbuild context is created because the define values
-  // are baked into the engine at compile time (the entity counter initializer reads it)
-  let maxCompositeEntity = 0
-  if (!options.ignoreComposite) {
-    const composites = await getAllComposites(components, options.workingDirectory)
-    maxCompositeEntity = composites.maxCompositeEntity
-  }
-
+function resolveSdkAliases(options: SingleProjectOptions): Record<string, string> {
   const sdkPackagePath = (() => {
     try {
       // First try to resolve from project's node_modules
@@ -185,12 +179,78 @@ export async function bundleSingleProject(components: BundleComponents, options:
       return path.dirname(require.resolve('@dcl/sdk/package.json', { paths: [__dirname] }))
     }
   })()
-  const context = await esbuild.context({
+  return {
+    // Ensure React is always resolved to the same module to prevent duplication
+    react: (() => {
+      try {
+        // First try to resolve from project's node_modules
+        return require.resolve('react', { paths: [options.workingDirectory] })
+      } catch {
+        try {
+          // Fallback to SDK's React dependency
+          return require.resolve('react', { paths: [path.join(__dirname, '../../../@dcl/sdk')] })
+        } catch {
+          // Final fallback to bundled React
+          return require.resolve('react')
+        }
+      }
+    })(),
+    // Ensure @dcl/sdk is always resolved to workspace version to prevent version conflicts
+    '@dcl/sdk': sdkPackagePath,
+    // Resolve ecs from sdk dependencies (nested in @dcl/sdk)
+    '@dcl/ecs': (() => {
+      try {
+        // First try to resolve from project's @dcl/sdk node_modules
+        return path.dirname(require.resolve('@dcl/ecs/package.json', { paths: [sdkPackagePath] }))
+      } catch {
+        try {
+          // Fallback: try to resolve from project's node_modules
+          return path.dirname(require.resolve('@dcl/ecs/package.json', { paths: [options.workingDirectory] }))
+        } catch {
+          // Last resort: try resolving from current directory
+          return path.dirname(require.resolve('@dcl/ecs/package.json', { paths: [__dirname] }))
+        }
+      }
+    })(),
+    // Resolve asset-packs from the scene's own node_modules (if the user explicitly installed it),
+    // otherwise fall back to the version bundled inside @dcl/inspector.
+    // NOTE: We use a direct path check (fs.existsSync) instead of require.resolve here because
+    // require.resolve walks UP the directory tree from workingDirectory, which would incorrectly
+    // pick up @dcl/asset-packs installed next to the scene (e.g. at a monorepo root) rather
+    // than the one the user intentionally installed inside the scene.
+    '@dcl/asset-packs': (() => {
+      const sceneOwnAssetPacks = path.join(
+        options.workingDirectory,
+        'node_modules',
+        '@dcl',
+        'asset-packs',
+        'package.json'
+      )
+      if (fs.existsSync(sceneOwnAssetPacks)) {
+        return path.dirname(sceneOwnAssetPacks)
+      }
+      try {
+        // Fallback: resolve from @dcl/inspector's node_modules
+        const inspectorPath = require.resolve('@dcl/inspector/package.json', { paths: [__dirname] })
+        return path.dirname(require.resolve('@dcl/asset-packs/package.json', { paths: [path.dirname(inspectorPath)] }))
+      } catch {
+        // Last resort: try resolving from current directory
+        return path.dirname(require.resolve('@dcl/asset-packs/package.json', { paths: [__dirname] }))
+      }
+    })()
+  }
+}
+
+function sharedEsbuildOptions(
+  options: SingleProjectOptions,
+  maxCompositeEntity: number,
+  outputFile: string
+): esbuild.BuildOptions {
+  return {
     bundle: true,
     platform: 'browser',
     format: 'cjs',
     preserveSymlinks: false,
-    outfile: options.outputFile,
     allowOverwrite: false,
     sourcemap: options.production ? false : 'inline',
     minify: options.production,
@@ -201,71 +261,8 @@ export async function bundleSingleProject(components: BundleComponents, options:
     metafile: true,
     absWorkingDir: options.workingDirectory,
     target: 'es2020',
-    external: ['~system/*', '@dcl/inspector', '@dcl/inspector/*' /* ban importing the inspector from the SDK */],
-    alias: {
-      // Ensure React is always resolved to the same module to prevent duplication
-      react: (() => {
-        try {
-          // First try to resolve from project's node_modules
-          return require.resolve('react', { paths: [options.workingDirectory] })
-        } catch {
-          try {
-            // Fallback to SDK's React dependency
-            return require.resolve('react', { paths: [path.join(__dirname, '../../../@dcl/sdk')] })
-          } catch {
-            // Final fallback to bundled React
-            return require.resolve('react')
-          }
-        }
-      })(),
-      // Ensure @dcl/sdk is always resolved to workspace version to prevent version conflicts
-      '@dcl/sdk': sdkPackagePath,
-      // Resolve ecs from sdk dependencies (nested in @dcl/sdk)
-      '@dcl/ecs': (() => {
-        try {
-          // First try to resolve from project's @dcl/sdk node_modules
-          return path.dirname(require.resolve('@dcl/ecs/package.json', { paths: [sdkPackagePath] }))
-        } catch {
-          try {
-            // Fallback: try to resolve from project's node_modules
-            return path.dirname(require.resolve('@dcl/ecs/package.json', { paths: [options.workingDirectory] }))
-          } catch {
-            // Last resort: try resolving from current directory
-            return path.dirname(require.resolve('@dcl/ecs/package.json', { paths: [__dirname] }))
-          }
-        }
-      })(),
-      // Resolve asset-packs from the scene's own node_modules (if the user explicitly installed it),
-      // otherwise fall back to the version bundled inside @dcl/inspector.
-      // NOTE: We use a direct path check (fs.existsSync) instead of require.resolve here because
-      // require.resolve walks UP the directory tree from workingDirectory, which would incorrectly
-      // pick up @dcl/asset-packs installed next to the scene (e.g. at a monorepo root) rather
-      // than the one the user intentionally installed inside the scene.
-      '@dcl/asset-packs': (() => {
-        const sceneOwnAssetPacks = path.join(
-          options.workingDirectory,
-          'node_modules',
-          '@dcl',
-          'asset-packs',
-          'package.json'
-        )
-        if (fs.existsSync(sceneOwnAssetPacks)) {
-          return path.dirname(sceneOwnAssetPacks)
-        }
-        try {
-          // Fallback: resolve from @dcl/inspector's node_modules
-          const inspectorPath = require.resolve('@dcl/inspector/package.json', { paths: [__dirname] })
-          return path.dirname(
-            require.resolve('@dcl/asset-packs/package.json', { paths: [path.dirname(inspectorPath)] })
-          )
-        } catch {
-          // Last resort: try resolving from current directory
-          return path.dirname(require.resolve('@dcl/asset-packs/package.json', { paths: [__dirname] }))
-        }
-      })()
-    },
     // convert filesystem paths into file:// to enable VSCode debugger
-    sourceRoot: options.production ? 'dcl:///' : pathToFileURL(path.dirname(options.outputFile)).toString(),
+    sourceRoot: options.production ? 'dcl:///' : pathToFileURL(path.dirname(outputFile)).toString(),
     define: {
       document: 'undefined',
       window: 'undefined',
@@ -283,7 +280,34 @@ export async function bundleSingleProject(components: BundleComponents, options:
     },
     logOverride: {
       'import-is-undefined': 'silent'
-    },
+    }
+  }
+}
+
+export async function bundleSingleProject(components: BundleComponents, options: SingleProjectOptions) {
+  // Only the preview/dev loop (watch mode) splits the scene into an SDK-runtime chunk, a scene
+  // chunk and a loader stub, so a reload re-fetches only the small scene chunk (the SDK chunk
+  // 304s). One-shot builds — `build`, `deploy`, code-to-composite (no watch) and `--single` —
+  // keep the single tree-shaken bundle, so production payloads are unchanged.
+  if (options.watch && !options.single) return bundleSplitProject(components, options)
+
+  printProgressStep(components.logger, `Bundling file ${colors.bold(options.entrypoint)}`, 1, MAX_STEP)
+  const editorScene = await isEditorScene(components, options.workingDirectory)
+
+  // Pre-compute composite data so we can inject maxCompositeEntity via esbuild define.
+  // This must happen before the esbuild context is created because the define values
+  // are baked into the engine at compile time (the entity counter initializer reads it)
+  let maxCompositeEntity = 0
+  if (!options.ignoreComposite) {
+    const composites = await getAllComposites(components, options.workingDirectory)
+    maxCompositeEntity = composites.maxCompositeEntity
+  }
+
+  const context = await esbuild.context({
+    ...sharedEsbuildOptions(options, maxCompositeEntity, options.outputFile),
+    outfile: options.outputFile,
+    external: HOST_AND_INSPECTOR_EXTERNALS,
+    alias: resolveSdkAliases(options),
     plugins: [compositeLoader(components, options)],
     stdin: {
       contents: getEntrypointCode(options.entrypoint, options.customEntryPoint, editorScene),
@@ -340,7 +364,112 @@ export async function bundleSingleProject(components: BundleComponents, options:
   await runTypeChecker(components, options)
 }
 
-function runTypeChecker(components: BundleComponents, options: CompileOptions) {
+// Preview/dev only (reached when options.watch): emit the scene as an SDK-runtime chunk, a scene
+// chunk and a loader stub, so a reload re-fetches only the small scene chunk while the SDK chunk
+// 304s. One-shot builds never come here — they keep the single tree-shaken bundle.
+async function bundleSplitProject(components: BundleComponents, options: SingleProjectOptions) {
+  const chunks = chunkPaths(options.outputFile)
+  const sceneOut = path.join(options.workingDirectory, chunks.scene)
+  const sdkOut = path.join(options.workingDirectory, chunks.sdk)
+  const mainOut = path.join(options.workingDirectory, options.outputFile)
+  const editorScene = await isEditorScene(components, options.workingDirectory)
+
+  let maxCompositeEntity = 0
+  if (!options.ignoreComposite) {
+    maxCompositeEntity = (await getAllComposites(components, options.workingDirectory)).maxCompositeEntity
+  }
+
+  // Emit all three files. Watch mode just re-runs this on change; esbuild is deterministic, so a
+  // scene-only edit re-emits an identical SDK chunk and a preview client 304s it (content-addressed).
+  const buildChunks = async () => {
+    // The scene chunk: just the scene code; the SDK, composites and scripts stay external.
+    const sceneResult = await buildSplitChunk({
+      ...sharedEsbuildOptions(options, maxCompositeEntity, chunks.scene),
+      outfile: sceneOut,
+      external: [...HOST_AND_INSPECTOR_EXTERNALS, ...sceneExternals],
+      plugins: [compositeLoader(components, options)],
+      stdin: {
+        contents: getEntrypointCode(options.entrypoint, options.customEntryPoint, editorScene),
+        resolveDir: path.dirname(options.entrypoint),
+        sourcefile: path.basename(options.entrypoint) + '.entry-point.ts',
+        loader: 'ts'
+      }
+    })
+
+    // The registry covers whatever the scene chunk imports (its metafile) plus a resolvable
+    // candidate superset, so an exotic deep import is never missing. It is tree-shaken like any
+    // build; esbuild is deterministic, so the chunk stays stable across reloads that don't touch
+    // the scene's imports and the preview client 304s it.
+    const keys = registryKeys(options.workingDirectory, collectSdkExternals(sceneResult.metafile))
+    await buildSplitChunk({
+      ...sharedEsbuildOptions(options, maxCompositeEntity, chunks.sdk),
+      outfile: sdkOut,
+      // a stable sourceRoot keeps the chunk from re-emitting just because the scene dir differs
+      sourceRoot: 'dcl:///',
+      external: HOST_AND_INSPECTOR_EXTERNALS,
+      alias: resolveSdkAliases(options),
+      plugins: [compositeLoader(components, options)],
+      stdin: {
+        contents: sdkRuntimeEntry(keys),
+        resolveDir: options.workingDirectory,
+        sourcefile: 'sdk-runtime-entry.js',
+        loader: 'js'
+      }
+    })
+
+    // The loader stub only references the chunk paths.
+    await components.fs.writeFile(mainOut, await loaderStub(components, chunks.sdk, chunks.scene))
+  }
+
+  printProgressStep(components.logger, `Bundling scene and SDK runtime`, 1, SPLIT_MAX_STEP)
+  await buildChunks()
+  printProgressStep(components.logger, `Loader stub saved ${colors.bold(options.outputFile)}`, 2, SPLIT_MAX_STEP)
+
+  /* istanbul ignore if */
+  if (options.watch) {
+    const watcher = watch(path.resolve(options.workingDirectory), {
+      ignored: ['**/dist/**', '**/*.crdt', '**/*.d.ts', sceneOut, sdkOut, mainOut],
+      ignoreInitial: true
+    })
+    const debouncedRebuild = debounce(async () => {
+      try {
+        await buildChunks()
+        printProgressInfo(components.logger, `Chunks saved ${colors.bold(chunks.scene)}`)
+      } catch (err: any) {
+        components.logger.error(err.toString())
+      }
+    }, 100)
+    watcher.on('all', (_event, filePath) => {
+      if (/\.(ts|tsx|js|jsx|composite)$/.test(filePath)) {
+        printProgressInfo(components.logger, `File ${filePath} changed, rebuilding...`)
+        debouncedRebuild()
+      }
+    })
+    printProgressInfo(components.logger, `The compiler is watching for changes`)
+  }
+
+  await runTypeChecker(components, options, 3, SPLIT_MAX_STEP)
+}
+
+async function buildSplitChunk(buildOptions: esbuild.BuildOptions) {
+  try {
+    return await esbuild.build(buildOptions)
+  } catch (err: any) {
+    throw new CliError('BUNDLE_REBUILD_FAILED', i18next.t('errors.bundle.rebuild_failed', { error: err.toString() }))
+  }
+}
+
+function collectSdkExternals(metafile: esbuild.Metafile | undefined): string[] {
+  const keys = new Set<string>()
+  for (const output of Object.values(metafile?.outputs ?? {})) {
+    for (const imported of output.imports) {
+      if (imported.external && isRegistryModule(imported.path)) keys.add(imported.path)
+    }
+  }
+  return [...keys].sort()
+}
+
+function runTypeChecker(components: BundleComponents, options: CompileOptions, step = 2, maxStep = MAX_STEP) {
   const tsBin = require.resolve('typescript/lib/tsc')
   const args = [
     '-p',
@@ -352,7 +481,7 @@ function runTypeChecker(components: BundleComponents, options: CompileOptions) {
   /* istanbul ignore if */
   if (options.watch) args.push('--watch')
 
-  printProgressStep(components.logger, `Running type checker`, 2, MAX_STEP)
+  printProgressStep(components.logger, `Running type checker`, step, maxStep)
   const ts = child_process.fork(tsBin, args, {
     stdio: 'pipe',
     env: process.env,
